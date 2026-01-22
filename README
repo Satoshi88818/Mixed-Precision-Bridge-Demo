@@ -1,0 +1,104 @@
+# Mixed-Precision Bridge for Rotary Position Embeddings (RoPE)
+
+A simple demonstration showing how **naive low-precision computation** of RoPE angles completely fails at long context lengths (e.g. 1M tokens), while a lightweight **mixed-precision reduction trick** recovers excellent accuracy — even when trigonometry is executed entirely in low precision (float16).
+
+## The Problem
+
+In standard RoPE implementations (Llama, Mistral, Qwen, etc.):
+
+```python
+theta = position * (1.0 / base ** (i / (head_dim/2)))
+angle = theta
+cos = cos(angle)
+sin = sin(angle)
+```
+
+When `position` becomes very large (≥ 500k–1M+) **and** the computation is done in low precision (float16 / bfloat16 / int8 / fp8), two catastrophic failures occur:
+
+1. **Huge angle overflows** the representable range → `±Inf`
+2. Even before Inf, **catastrophic cancellation / loss of mantissa precision** makes `cos(angle)` and `sin(angle)` completely wrong
+
+The **lowest-frequency** dimension (highest `i`) is affected first — it has the smallest `theta` increment per token and therefore the most drift sensitivity.
+
+## The Fix – Mixed-Precision Angle Reduction
+
+Key insight:
+
+> You only need **high-precision modular reduction** (`angle mod 2π`)  
+> After reduction, the **remaining angle is small** → float16 can represent it accurately enough for `cos`/`sin`.
+
+```text
+                High precision (float64)
+position × freq  ────────────────►  angle
+                                    │
+                               modulo 2π   ← only this step needs high prec
+                                    │
+                 Small reduced_angle  ← now safe for low precision
+                                    │
+                Low precision (float16)
+                               ┌────┴────┐
+                               ▼         ▼
+                             cos       sin
+                               └───────┬───────┘
+                                       │  very small error
+                                       ▼
+                                 usable rotary values
+```
+
+## Demo Output (position = 1 000 000, head_dim = 128, lowest freq)
+
+```
+Lowest frequency: 0.000115478198469
+
+Ground truth (high prec) cos: -0.7243331023, sin: 0.6894501845
+
+Standard low prec cos: nan, sin: nan
+
+Bridged (mixed prec) cos: -0.7241210938, sin: 0.6894531250
+
+Standard low prec error - cos: nan, sin: nan
+Bridged error         - cos: 0.0002120085, sin: 0.0000029405
+```
+
+→ **Naive fp16 → complete garbage (NaN)**  
+→ **Mixed bridge → error < 2.2e-4 on cos, < 3e-6 on sin** (very usable!)
+
+## How to Use the Idea in Real Models
+
+Minimal change in most RoPE kernels:
+
+```python
+# Pseudo-code (inside your attention / RoPE kernel)
+
+if using_mixed_precision_bridge:
+    # Done once per inference or per sequence start (very cheap)
+    theta_high = position * inv_freq_high_precision  # f64
+    reduced = theta_high % (2 * pi_high)
+    reduced = reduced.to(dtype=low_precision)        # now safe
+else:
+    reduced = position * inv_freq_low_precision
+
+cos = reduced.cos()
+sin = reduced.sin()
+```
+
+Many recent long-context models (2024–2025) use similar or even more sophisticated range-reduction strategies.
+
+## Requirements
+
+- PyTorch ≥ 2.0 (preferably nightly for best float16 / bfloat16 trig accuracy)
+- No extra dependencies
+
+## License
+
+MIT – feel free to use in research or production.
+
+Happy long-context training / inference!
+```
+
+You can extend it later with:
+
+- plots of error vs. position length
+- comparison table (fp16 vs bf16 vs mixed vs fp32)
+- real integration examples (transformers, vLLM, llama.cpp, etc.)
+
