@@ -1,0 +1,48 @@
+import torch
+
+# Parameters (standard Llama-like RoPE)
+base = 10000.0
+head_dim = 128
+position = 1_000_000  # Long context position (e.g., beyond typical 128k)
+k = head_dim // 2 - 1  # Index for lowest frequency (most sensitive to long-range drift)
+
+high_prec = torch.float64
+low_prec = torch.float16  # Simulates constrained low-bit compute (worse range/mantissa than BF16)
+
+# Compute inverse frequencies in high precision
+arange = torch.arange(0, head_dim // 2, dtype=high_prec)
+exponents = arange / (head_dim // 2.0)
+freqs_high = 1.0 / (base ** exponents)
+freq = freqs_high[k]  # Lowest (smallest) frequency
+
+print(f"Lowest frequency: {freq.item():.15f}")
+
+# Ground truth: Full high precision
+angle_high = torch.tensor(position, dtype=high_prec) * freq
+cos_high = torch.cos(angle_high)
+sin_high = torch.sin(angle_high)
+print(f"\nGround truth (high prec) cos: {cos_high.item():.10f}, sin: {sin_high.item():.10f}")
+
+# Standard low-precision computation (simulates naive 8-bit-like execution)
+freq_low = freq.to(low_prec)
+pos_low = torch.tensor(position, dtype=low_prec)
+angle_low = pos_low * freq_low
+cos_low = torch.cos(angle_low)
+sin_low = torch.sin(angle_low)
+cos_low = cos_low.to(high_prec) if not torch.isnan(cos_low) else torch.tensor(float('nan'))
+sin_low = sin_low.to(high_prec) if not torch.isnan(sin_low) else torch.tensor(float('nan'))
+print(f"Standard low prec cos: {cos_low.item():.10f}, sin: {sin_low.item():.10f}")
+
+# Mixed-precision bridge: Accurate reduction in high prec, then trig in low
+pi_high = torch.acos(torch.tensor(-1.0, dtype=high_prec))
+reduced_angle = angle_high % (2 * pi_high)
+if reduced_angle < 0:
+    reduced_angle += 2 * pi_high  # Ensure positive
+reduced_low = reduced_angle.to(low_prec)
+cos_bridge = torch.cos(reduced_low).to(high_prec)
+sin_bridge = torch.sin(reduced_low).to(high_prec)
+print(f"Bridged (mixed prec) cos: {cos_bridge.item():.10f}, sin: {sin_bridge.item():.10f}")
+
+# Errors
+print(f"\nStandard low prec error - cos: {abs(cos_high - cos_low).item():.10f}, sin: {abs(sin_high - sin_low).item():.10f}")
+print(f"Bridged error - cos: {abs(cos_high - cos_bridge).item():.10f}, sin: {abs(sin_high - sin_bridge).item():.10f}")
